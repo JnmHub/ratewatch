@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"log"
@@ -25,27 +26,31 @@ import (
 	"ratewatch/internal/security"
 	"ratewatch/internal/store"
 	"ratewatch/internal/syncer"
+	"ratewatch/internal/updater"
 )
 
 type Server struct {
-	cfg    config.Config
-	store  *store.Store
-	vault  *security.Vault
-	client *connectors.Client
-	engine *syncer.Engine
-	hub    *syncer.Hub
-	mux    *http.ServeMux
+	cfg     config.Config
+	store   *store.Store
+	vault   *security.Vault
+	client  *connectors.Client
+	engine  *syncer.Engine
+	hub     *syncer.Hub
+	update  *updater.Manager
+	restart func()
+	mux     *http.ServeMux
 }
 type contextKey string
 
 const userKey contextKey = "userID"
 
 func New(cfg config.Config, st *store.Store, v *security.Vault, c *connectors.Client, e *syncer.Engine, h *syncer.Hub) *Server {
-	s := &Server{cfg: cfg, store: st, vault: v, client: c, engine: e, hub: h, mux: http.NewServeMux()}
+	s := &Server{cfg: cfg, store: st, vault: v, client: c, engine: e, hub: h, update: updater.New(), mux: http.NewServeMux()}
 	s.routes()
 	return s
 }
-func (s *Server) Handler() http.Handler { return s.securityHeaders(s.recover(s.mux)) }
+func (s *Server) Handler() http.Handler      { return s.securityHeaders(s.recover(s.mux)) }
+func (s *Server) SetRestart(callback func()) { s.restart = callback }
 func (s *Server) routes() {
 	s.mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) { write(w, 200, map[string]any{"ok": true}) })
 	s.mux.HandleFunc("GET /api/public-config", s.publicConfig)
@@ -62,12 +67,14 @@ func (s *Server) routes() {
 	s.mux.Handle("GET /api/dashboard", s.auth(http.HandlerFunc(s.dashboard)))
 	s.mux.Handle("GET /api/sites", s.auth(http.HandlerFunc(s.listSites)))
 	s.mux.Handle("POST /api/sites", s.auth(http.HandlerFunc(s.createSite)))
+	s.mux.Handle("PUT /api/sites/{id}", s.auth(http.HandlerFunc(s.updateSite)))
 	s.mux.Handle("DELETE /api/sites/{id}", s.auth(http.HandlerFunc(s.deleteSite)))
 	s.mux.Handle("POST /api/sites/{id}/import", s.auth(http.HandlerFunc(s.importSite)))
 	s.mux.Handle("GET /api/sites/{id}/inventory", s.auth(http.HandlerFunc(s.inventory)))
 	s.mux.Handle("POST /api/sources/detect", s.auth(http.HandlerFunc(s.detectSource)))
 	s.mux.Handle("GET /api/sources", s.auth(http.HandlerFunc(s.listSources)))
 	s.mux.Handle("POST /api/sources", s.auth(http.HandlerFunc(s.createSource)))
+	s.mux.Handle("PUT /api/sources/{id}", s.auth(http.HandlerFunc(s.updateSource)))
 	s.mux.Handle("POST /api/sources/{id}/sync", s.auth(http.HandlerFunc(s.syncSource)))
 	s.mux.Handle("DELETE /api/sources/{id}", s.auth(http.HandlerFunc(s.deleteSource)))
 	s.mux.Handle("GET /api/tasks", s.auth(http.HandlerFunc(s.listTasks)))
@@ -88,6 +95,8 @@ func (s *Server) routes() {
 	s.mux.Handle("POST /api/admin/demo-data", s.auth(s.admin(http.HandlerFunc(s.adminDemoData))))
 	s.mux.Handle("GET /api/admin/settings", s.auth(s.admin(http.HandlerFunc(s.adminSettings))))
 	s.mux.Handle("PUT /api/admin/settings", s.auth(s.admin(http.HandlerFunc(s.updateAdminSettings))))
+	s.mux.Handle("GET /api/admin/update", s.auth(s.admin(http.HandlerFunc(s.adminUpdateStatus))))
+	s.mux.Handle("POST /api/admin/update", s.auth(s.admin(http.HandlerFunc(s.adminInstallUpdate))))
 	s.mux.HandleFunc("/", s.frontend)
 }
 
@@ -427,6 +436,34 @@ func (s *Server) updateAdminSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	s.adminSettings(w, r)
 }
+func (s *Server) adminUpdateStatus(w http.ResponseWriter, r *http.Request) {
+	status, err := s.update.Check(r.Context())
+	if err != nil {
+		problem(w, http.StatusBadGateway, "检查 GitHub 发行版失败: "+err.Error())
+		return
+	}
+	if status.CanAutoUpdate && s.restart == nil {
+		status.CanAutoUpdate = false
+		status.Reason = "当前运行方式未启用自动重启"
+	}
+	write(w, http.StatusOK, status)
+}
+func (s *Server) adminInstallUpdate(w http.ResponseWriter, r *http.Request) {
+	if s.restart == nil {
+		problem(w, http.StatusConflict, "当前运行方式未启用自动重启")
+		return
+	}
+	result, err := s.update.Install(r.Context())
+	if err != nil {
+		problem(w, http.StatusUnprocessableEntity, err.Error())
+		return
+	}
+	write(w, http.StatusAccepted, result)
+	go func() {
+		time.Sleep(800 * time.Millisecond)
+		s.restart()
+	}()
+}
 func (s *Server) updateNotifications(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		Email   string   `json:"notify_email"`
@@ -470,25 +507,24 @@ func (s *Server) listSites(w http.ResponseWriter, r *http.Request) {
 	}
 	write(w, 200, nonNil(v))
 }
-func (s *Server) createSite(w http.ResponseWriter, r *http.Request) {
-	var in struct {
-		Name        string `json:"name"`
-		BaseURL     string `json:"base_url"`
-		Platform    string `json:"platform"`
-		AdminKey    string `json:"admin_key"`
-		AdminUserID string `json:"admin_user_id"`
-		AdminHeader string `json:"admin_header"`
-	}
-	if !decode(w, r, &in) {
-		return
-	}
+
+type siteInput struct {
+	Name        string `json:"name"`
+	BaseURL     string `json:"base_url"`
+	Platform    string `json:"platform"`
+	AdminKey    string `json:"admin_key"`
+	AdminUserID string `json:"admin_user_id"`
+	AdminHeader string `json:"admin_header"`
+}
+
+func normalizeSiteInput(in *siteInput) error {
+	in.Name = strings.TrimSpace(in.Name)
+	in.BaseURL = strings.TrimRight(strings.TrimSpace(in.BaseURL), "/")
 	if in.Platform != "newapi" && in.Platform != "sub2api" {
-		problem(w, 400, "站点类型必须是 newapi 或 sub2api")
-		return
+		return errors.New("站点类型必须是 newapi 或 sub2api")
 	}
-	if in.Name == "" || in.BaseURL == "" || in.AdminKey == "" {
-		problem(w, 400, "名称、域名和管理员 Key 必填")
-		return
+	if in.Name == "" || in.BaseURL == "" {
+		return errors.New("名称和域名必填")
 	}
 	if in.Platform == "sub2api" {
 		in.AdminUserID = ""
@@ -500,6 +536,22 @@ func (s *Server) createSite(w http.ResponseWriter, r *http.Request) {
 		if in.AdminHeader == "" {
 			in.AdminHeader = "Authorization"
 		}
+	}
+	return nil
+}
+
+func (s *Server) createSite(w http.ResponseWriter, r *http.Request) {
+	var in siteInput
+	if !decode(w, r, &in) {
+		return
+	}
+	if err := normalizeSiteInput(&in); err != nil {
+		problem(w, 400, err.Error())
+		return
+	}
+	if strings.TrimSpace(in.AdminKey) == "" {
+		problem(w, 400, "名称、域名和管理员 Key 必填")
+		return
 	}
 	enc, e := s.vault.Encrypt(in.AdminKey)
 	if e != nil {
@@ -521,6 +573,56 @@ func (s *Server) createSite(w http.ResponseWriter, r *http.Request) {
 	site, _ = s.store.Site(uid(r), site.ID)
 	site.AdminSecret = ""
 	write(w, 201, site)
+}
+func (s *Server) updateSite(w http.ResponseWriter, r *http.Request) {
+	userID, siteID := uid(r), pathID(r)
+	existing, err := s.store.Site(userID, siteID)
+	if err != nil {
+		problem(w, http.StatusNotFound, "站点不存在")
+		return
+	}
+	var in siteInput
+	if !decode(w, r, &in) {
+		return
+	}
+	if err = normalizeSiteInput(&in); err != nil {
+		problem(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	secret := existing.AdminSecret
+	adminKey, err := s.vault.Decrypt(secret)
+	if err != nil {
+		problem(w, http.StatusUnprocessableEntity, "管理员 Key 解密失败，请重新填写")
+		return
+	}
+	if strings.TrimSpace(in.AdminKey) != "" {
+		adminKey = in.AdminKey
+		secret, err = s.vault.Encrypt(adminKey)
+		if err != nil {
+			problem(w, http.StatusInternalServerError, "管理员 Key 保存失败")
+			return
+		}
+	}
+	managed := connectors.ManagedSite{BaseURL: in.BaseURL, Platform: in.Platform, Auth: connectors.Auth{Secret: adminKey, Header: in.AdminHeader, UserID: in.AdminUserID}}
+	groups, accounts, err := s.client.Import(r.Context(), managed)
+	if err != nil {
+		problem(w, http.StatusUnprocessableEntity, "新设置连接失败，原配置未修改: "+err.Error())
+		return
+	}
+	updated, err := s.store.UpdateSite(store.Site{ID: siteID, UserID: userID, Name: in.Name, BaseURL: in.BaseURL, Platform: in.Platform, AdminSecret: secret, AdminUserID: in.AdminUserID, AdminHeader: in.AdminHeader})
+	if err != nil {
+		problem(w, http.StatusConflict, "站点更新失败: "+err.Error())
+		return
+	}
+	if err = s.store.ReplaceInventory(userID, siteID, groups, accounts); err != nil {
+		_ = s.store.SetSiteStatus(userID, siteID, "error", err.Error(), false)
+		problem(w, http.StatusInternalServerError, "站点已保存，但关系树更新失败: "+err.Error())
+		return
+	}
+	_ = s.store.SetSiteStatus(userID, siteID, "ready", "", true)
+	updated, _ = s.store.Site(userID, siteID)
+	updated.AdminSecret = ""
+	write(w, http.StatusOK, updated)
 }
 func (s *Server) deleteSite(w http.ResponseWriter, r *http.Request) {
 	if e := s.store.DeleteSite(uid(r), pathID(r)); e != nil {
@@ -801,6 +903,71 @@ func (s *Server) createSource(w http.ResponseWriter, r *http.Request) {
 	src.Secret = ""
 	src.SecretMask = security.MaskSecret(in.Key)
 	write(w, 201, src)
+}
+func (s *Server) updateSource(w http.ResponseWriter, r *http.Request) {
+	userID, sourceID := uid(r), pathID(r)
+	existing, err := s.store.Source(userID, sourceID)
+	if err != nil {
+		problem(w, http.StatusNotFound, "上游不存在")
+		return
+	}
+	var in sourceInput
+	if !decode(w, r, &in) {
+		return
+	}
+	in.Name = strings.TrimSpace(in.Name)
+	in.BaseURL = strings.TrimRight(strings.TrimSpace(in.BaseURL), "/")
+	in.ProbeModel = strings.TrimSpace(in.ProbeModel)
+	if in.Name == "" || in.BaseURL == "" {
+		problem(w, http.StatusBadRequest, "上游名称和地址必填")
+		return
+	}
+	secret := existing.Secret
+	var key string
+	if strings.TrimSpace(in.Key) != "" {
+		key = in.Key
+		secret, err = s.vault.Encrypt(key)
+		if err != nil {
+			problem(w, http.StatusInternalServerError, "上游 Key 保存失败")
+			return
+		}
+	} else {
+		key, err = s.vault.Decrypt(secret)
+		if err != nil {
+			problem(w, http.StatusUnprocessableEntity, "上游 Key 解密失败，请重新填写")
+			return
+		}
+	}
+	fingerprint := security.Fingerprint(in.BaseURL, key)
+	if s.store.SourceFingerprintExistsExcept(userID, sourceID, fingerprint) {
+		problem(w, http.StatusConflict, "相同地址和 Key 的上游已经存在")
+		return
+	}
+	in.Key = key
+	capability, err := s.detectSourceCapability(r.Context(), userID, in)
+	monitorable := capability.MonitorState == connectors.MonitorDirect ||
+		(capability.MonitorState == connectors.MonitorNewAPIProbe && in.ProbeModel != "" && capability.Rate != nil)
+	if err != nil || !monitorable {
+		problem(w, http.StatusUnprocessableEntity, "新设置无法持续监听，原配置未修改: "+capability.Message)
+		return
+	}
+	models := capability.Models
+	if len(models) == 0 {
+		models = existing.Models
+	}
+	lastRate := capability.Rate
+	if lastRate == nil {
+		lastRate = existing.LastRate
+	}
+	updated, err := s.store.UpdateSource(store.Source{ID: sourceID, UserID: userID, Name: in.Name, BaseURL: in.BaseURL, Platform: capability.Platform, Secret: secret, Fingerprint: fingerprint, MonitorState: capability.MonitorState, ProbeModel: in.ProbeModel, Models: models, LastRate: lastRate})
+	if err != nil {
+		problem(w, http.StatusConflict, "上游更新失败: "+err.Error())
+		return
+	}
+	_ = s.store.AddSourceHealth(userID, sourceID, "healthy", "配置已更新并通过连接检查", lastRate)
+	updated.Secret = ""
+	updated.SecretMask = security.MaskSecret(key)
+	write(w, http.StatusOK, updated)
 }
 func (s *Server) deleteSource(w http.ResponseWriter, r *http.Request) {
 	if e := s.store.DeleteSource(uid(r), pathID(r)); e != nil {

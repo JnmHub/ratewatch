@@ -147,6 +147,19 @@ func TestDetectSourceAcceptsCompleteFrontendPayload(t *testing.T) {
 	if err = json.NewDecoder(createResp.Body).Decode(&createdSource); err != nil {
 		t.Fatal(err)
 	}
+	updatePayload, _ := json.Marshal(map[string]any{"name": "edited source", "base_url": upstream.URL, "key": "", "probe_model": ""})
+	updateReq, _ := http.NewRequest(http.MethodPut, srv.URL+"/api/sources/"+strconv.FormatInt(createdSource.ID, 10), bytes.NewReader(updatePayload))
+	updateReq.Header.Set("Authorization", "Bearer "+session.Token)
+	updateReq.Header.Set("Content-Type", "application/json")
+	updateResp, err := http.DefaultClient.Do(updateReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer updateResp.Body.Close()
+	var updatedSource store.Source
+	if err = json.NewDecoder(updateResp.Body).Decode(&updatedSource); err != nil || updateResp.StatusCode != http.StatusOK || updatedSource.Name != "edited source" || updatedSource.SecretMask == "" {
+		t.Fatalf("update status=%d source=%+v err=%v", updateResp.StatusCode, updatedSource, err)
+	}
 	syncReq, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/sources/"+strconv.FormatInt(createdSource.ID, 10)+"/sync", nil)
 	syncReq.Header.Set("Authorization", "Bearer "+session.Token)
 	syncResp, err := http.DefaultClient.Do(syncReq)
@@ -321,6 +334,72 @@ func TestCreateSourceBuildsIndependentTasksForMultipleTargetGroups(t *testing.T)
 	byGroup := map[int64]store.Task{tasks[0].GroupID: tasks[0], tasks[1].GroupID: tasks[1]}
 	if byGroup[groups[0].ID].MinUpstreamRate != 1.0 || byGroup[groups[0].ID].Adjustment != 0.1 || byGroup[groups[1].ID].MinUpstreamRate != 1.2 || byGroup[groups[1].ID].Adjustment != -0.1 {
 		t.Fatalf("tasks=%+v", tasks)
+	}
+}
+
+func TestUpdateSiteKeepsSavedAdminKeyAndRefreshesInventory(t *testing.T) {
+	managedMux := http.NewServeMux()
+	managedMux.HandleFunc("GET /api/v1/admin/groups", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("x-api-key") != "admin-secret" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": []map[string]any{{"id": 101, "name": "default", "rate_multiplier": 1.25, "status": "active"}}})
+	})
+	managedMux.HandleFunc("GET /api/v1/admin/accounts", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": []any{}})
+	})
+	managed := httptest.NewServer(managedMux)
+	defer managed.Close()
+
+	key := []byte("0123456789abcdef0123456789abcdef")
+	cfg := config.Config{MasterKey: key, SessionSecret: key, PollInterval: time.Hour, ProbeInterval: time.Hour, ModelInterval: time.Hour, EmailInterval: time.Hour}
+	st, err := store.Open(filepath.Join(t.TempDir(), "update-site.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	vault, _ := security.NewVault(key)
+	client := connectors.New()
+	hub := syncer.NewHub()
+	engine := syncer.New(st, vault, client, hub, cfg)
+	srv := httptest.NewServer(New(cfg, st, vault, client, engine, hub).Handler())
+	defer srv.Close()
+
+	registerBody, _ := json.Marshal(map[string]string{"email": "site-edit@example.com", "password": "password-123"})
+	registerResp, err := http.Post(srv.URL+"/api/auth/register", "application/json", bytes.NewReader(registerBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer registerResp.Body.Close()
+	var session struct {
+		Token string `json:"token"`
+	}
+	if err = json.NewDecoder(registerResp.Body).Decode(&session); err != nil {
+		t.Fatal(err)
+	}
+	user, _ := st.UserByEmail("site-edit@example.com")
+	encrypted, _ := vault.Encrypt("admin-secret")
+	site, err := st.CreateSite(store.Site{UserID: user.ID, Name: "old name", BaseURL: managed.URL, Platform: "sub2api", AdminSecret: encrypted, AdminHeader: "x-api-key"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, _ := json.Marshal(map[string]any{"name": "new name", "base_url": managed.URL, "platform": "sub2api", "admin_key": "", "admin_user_id": "", "admin_header": "x-api-key"})
+	req, _ := http.NewRequest(http.MethodPut, srv.URL+"/api/sites/"+strconv.FormatInt(site.ID, 10), bytes.NewReader(payload))
+	req.Header.Set("Authorization", "Bearer "+session.Token)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var updated store.Site
+	if err = json.NewDecoder(resp.Body).Decode(&updated); err != nil || resp.StatusCode != http.StatusOK || updated.Name != "new name" {
+		t.Fatalf("update status=%d site=%+v err=%v", resp.StatusCode, updated, err)
+	}
+	inventory, err := st.Inventory(user.ID, site.ID)
+	if err != nil || len(inventory) != 1 || inventory[0].Name != "default" || inventory[0].Rate != 1.25 {
+		t.Fatalf("inventory=%+v err=%v", inventory, err)
 	}
 }
 

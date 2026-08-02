@@ -15,9 +15,14 @@ import (
 	"ratewatch/internal/security"
 	"ratewatch/internal/store"
 	"ratewatch/internal/syncer"
+	"ratewatch/internal/updater"
 )
 
 func main() {
+	if updater.RunHelper(os.Args) {
+		return
+	}
+	go updater.CleanupHelpers()
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatal(err)
@@ -45,6 +50,7 @@ func main() {
 	defer cancel()
 	engine.Start(ctx)
 	api := httpapi.New(cfg, st, vault, client, engine, hub)
+	api.SetRestart(cancel)
 	srv := &http.Server{Addr: cfg.Addr, Handler: api.Handler(), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 1 << 20}
 	go func() {
 		<-ctx.Done()

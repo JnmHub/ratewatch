@@ -6,7 +6,7 @@
         <h1>站点与关系树</h1>
         <p>添加你自己的站点后，会自动读取分组、渠道或账号及当前倍率，并整理成清晰的关联关系。</p>
       </div>
-      <FmButton variant="primary" @click="modal = true">添加站点</FmButton>
+      <FmButton variant="primary" @click="openCreate">添加站点</FmButton>
     </header>
 
     <div class="filter-bar">
@@ -16,7 +16,7 @@
 
     <FmStatePanel v-if="loading" state="loading" />
     <FmStatePanel v-else-if="!sites.length" state="empty" title="还没有自有站点" description="先添加你的 New API 或 Sub2API，系统会立即校验管理员连接并导入关系树">
-      <template #action><FmButton variant="primary" @click="modal = true">添加第一个站点</FmButton></template>
+      <template #action><FmButton variant="primary" @click="openCreate">添加第一个站点</FmButton></template>
     </FmStatePanel>
 
     <section v-for="site in sites" :key="site.id" class="section">
@@ -27,6 +27,7 @@
         </div>
         <div class="fm-actions">
           <FmButton variant="outline" :loading="importing === site.id" @click="refresh(site)">重新导入</FmButton>
+          <FmButton variant="ghost" @click="edit(site)">编辑</FmButton>
           <FmButton variant="danger" @click="remove(site)">删除</FmButton>
         </div>
       </div>
@@ -58,12 +59,12 @@
       </div>
     </section>
 
-    <FmModal v-model="modal" title="添加我的站点" kicker="连接站点" description="保存后会立即检查连接并读取现有分组和账号。">
-      <form id="site-form" @submit.prevent="create">
+    <FmModal v-model="modal" :title="editingId ? '编辑我的站点' : '添加我的站点'" kicker="连接站点" :description="editingId ? '保存前会先验证新设置，连接失败时保留原配置。' : '保存后会立即检查连接并读取现有分组和账号。'">
+      <form id="site-form" @submit.prevent="save">
         <label class="field"><span>站点名称</span><input v-model.trim="form.name" required placeholder="例如：主站" /></label>
         <label class="field"><span>站点类型</span><FmSelect v-model="form.platform" aria-label="站点类型" :options="platformOptions" /></label>
         <label class="field"><span>站点域名</span><input v-model.trim="form.base_url" type="url" required placeholder="https://api.example.com" /></label>
-        <label class="field"><span>永久管理员 Key</span><input v-model="form.admin_key" type="password" required autocomplete="off" /></label>
+        <label class="field"><span>永久管理员 Key</span><input v-model="form.admin_key" type="password" :required="!editingId" :placeholder="editingId ? '已保存，留空表示不修改' : ''" autocomplete="new-password" /><small v-if="editingId">只有需要更换管理员 Key 时才填写。</small></label>
         <details class="advanced"><summary>高级设置</summary><div class="advanced-body grid-2 aligned-fields">
           <label class="field"><span>管理员用户 ID</span><input v-model="form.admin_user_id" :disabled="form.platform === 'sub2api'" /><small>{{ form.platform === 'sub2api' ? 'Sub2API 不需要此项' : 'New API 通常保持 1' }}</small></label>
           <label class="field"><span>鉴权方式（自动）</span><input v-model="form.admin_header" readonly /><small>已根据站点类型自动匹配，无需手工修改</small></label>
@@ -71,8 +72,8 @@
         <div v-if="error" class="notice error">{{ error }}</div>
       </form>
       <template #actions>
-        <FmButton variant="ghost" @click="modal = false">取消</FmButton>
-        <FmButton variant="primary" type="submit" form="site-form" :loading="saving">保存并导入</FmButton>
+        <FmButton variant="ghost" @click="closeModal">取消</FmButton>
+        <FmButton variant="primary" type="submit" form="site-form" :loading="saving">{{ editingId ? '保存并重新导入' : '保存并导入' }}</FmButton>
       </template>
     </FmModal>
   </div>
@@ -87,7 +88,7 @@ import FmModal from "../ui/freemodel/components/FmModal.vue";
 import FmStatePanel from "../ui/freemodel/components/FmStatePanel.vue";
 import FmStatusPill from "../ui/freemodel/components/FmStatusPill.vue";
 
-const loading = ref(true), sites = ref([]), inventories = reactive({}), modal = ref(false), saving = ref(false), importing = ref(0), error = ref("");
+const loading = ref(true), sites = ref([]), inventories = reactive({}), modal = ref(false), saving = ref(false), importing = ref(0), editingId = ref(0), error = ref("");
 const filters = reactive({ query: "", state: "all" });
 const filterOptions = [{ value: "all", label: "全部状态" }, { value: "monitorable", label: "可监听" }, { value: "attention", label: "需要处理" }];
 const platformOptions = [{ value: "newapi", label: "New API" }, { value: "sub2api", label: "Sub2API" }];
@@ -105,13 +106,17 @@ async function load() {
   } catch (e) { toast(e.message, "error"); }
   finally { loading.value = false; }
 }
-async function create() {
+function resetForm() { Object.assign(form, { name: "", platform: "newapi", base_url: "", admin_key: "", admin_user_id: "1", admin_header: "Authorization" }); }
+function openCreate() { editingId.value = 0; resetForm(); error.value = ""; modal.value = true; }
+function edit(site) { editingId.value = site.id; Object.assign(form, { name: site.name, platform: site.platform, base_url: site.base_url, admin_key: "", admin_user_id: site.admin_user_id || (site.platform === "newapi" ? "1" : ""), admin_header: site.platform === "sub2api" ? "x-api-key" : (site.admin_header || "Authorization") }); error.value = ""; modal.value = true; }
+function closeModal() { modal.value = false; editingId.value = 0; error.value = ""; resetForm(); }
+async function save() {
   saving.value = true; error.value = "";
   try {
-    const site = await api("/api/sites", { method: "POST", body: JSON.stringify(form) });
-    modal.value = false;
-    Object.assign(form, { name: "", platform: "newapi", base_url: "", admin_key: "", admin_user_id: "1", admin_header: "Authorization" });
-    toast(site.status === "ready" ? "站点已连接并完成首次导入" : "站点已保存，但首次导入失败，请查看连接异常", site.status === "ready" ? "ok" : "warning");
+    const updating = editingId.value > 0;
+    const site = await api(updating ? `/api/sites/${editingId.value}` : "/api/sites", { method: updating ? "PUT" : "POST", body: JSON.stringify(form) });
+    closeModal();
+    toast(updating ? "站点设置已更新，关系树已重新导入" : site.status === "ready" ? "站点已连接并完成首次导入" : "站点已保存，但首次导入失败，请查看连接异常", updating || site.status === "ready" ? "ok" : "warning");
     await load();
   } catch (e) { error.value = e.message; toast(e.message, "error"); }
   finally { saving.value = false; }

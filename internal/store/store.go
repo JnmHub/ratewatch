@@ -159,6 +159,16 @@ func (s *Store) CreateSite(v Site) (Site, error) {
 	id, _ := r.LastInsertId()
 	return s.Site(v.UserID, id)
 }
+func (s *Store) UpdateSite(v Site) (Site, error) {
+	result, err := s.DB.Exec(`UPDATE sites SET name=?,base_url=?,platform=?,admin_secret=?,admin_user_id=?,admin_header=?,status='ready',last_error='',last_imported_at=CURRENT_TIMESTAMP WHERE user_id=? AND id=?`, v.Name, trimURL(v.BaseURL), v.Platform, v.AdminSecret, v.AdminUserID, v.AdminHeader, v.UserID, v.ID)
+	if err != nil {
+		return Site{}, err
+	}
+	if count, _ := result.RowsAffected(); count == 0 {
+		return Site{}, errors.New("站点不存在")
+	}
+	return s.Site(v.UserID, v.ID)
+}
 func (s *Store) Sites(uid int64) ([]Site, error) {
 	rows, e := s.DB.Query(`SELECT id,name,base_url,platform,admin_user_id,admin_header,status,last_error,last_imported_at,created_at FROM sites WHERE user_id=? ORDER BY id DESC`, uid)
 	if e != nil {
@@ -318,9 +328,29 @@ func (s *Store) SourceFingerprintExists(uid int64, fingerprint string) bool {
 	_ = s.DB.QueryRow(`SELECT count(*) FROM sources WHERE user_id=? AND fingerprint=?`, uid, fingerprint).Scan(&n)
 	return n > 0
 }
+func (s *Store) SourceFingerprintExistsExcept(uid, sourceID int64, fingerprint string) bool {
+	var n int
+	_ = s.DB.QueryRow(`SELECT count(*) FROM sources WHERE user_id=? AND fingerprint=? AND id<>?`, uid, fingerprint, sourceID).Scan(&n)
+	return n > 0
+}
 func (s *Store) Source(uid, id int64) (Source, error) {
 	row := s.DB.QueryRow(`SELECT id,name,base_url,platform,secret,monitor_state,probe_model,models_json,last_rate,last_error,last_checked_at,created_at FROM sources WHERE user_id=? AND id=?`, uid, id)
 	return scanSource(row, uid)
+}
+
+func (s *Store) UpdateSource(v Source) (Source, error) {
+	models, err := json.Marshal(v.Models)
+	if err != nil {
+		return Source{}, err
+	}
+	result, err := s.DB.Exec(`UPDATE sources SET name=?,base_url=?,platform=?,secret=?,fingerprint=?,monitor_state=?,probe_model=?,models_json=?,last_rate=?,last_error='',last_checked_at=CURRENT_TIMESTAMP WHERE user_id=? AND id=?`, v.Name, trimURL(v.BaseURL), v.Platform, v.Secret, v.Fingerprint, v.MonitorState, v.ProbeModel, string(models), v.LastRate, v.UserID, v.ID)
+	if err != nil {
+		return Source{}, err
+	}
+	if count, _ := result.RowsAffected(); count == 0 {
+		return Source{}, errors.New("上游不存在")
+	}
+	return s.Source(v.UserID, v.ID)
 }
 
 type scanner interface{ Scan(...any) error }

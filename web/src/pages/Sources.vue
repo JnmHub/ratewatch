@@ -11,21 +11,21 @@
       <template #cell-last_rate="{ value }"><span class="mono">{{ value == null ? '待探测' : fmt(value) }}</span></template>
       <template #cell-models="{ value }">{{ value?.length || 0 }} 个模型</template>
       <template #cell-health="{ row }"><HealthStrip :items="row.health_history" /></template>
-      <template #actions="{ row }"><FmButton variant="outline" :loading="syncing === row.id" @click="syncNow(row)">立刻同步并查看</FmButton><FmButton variant="danger" :disabled="syncing === row.id" @click="remove(row)">删除</FmButton></template>
+      <template #actions="{ row }"><FmButton variant="outline" :loading="syncing === row.id" @click="syncNow(row)">立刻同步并查看</FmButton><FmButton variant="ghost" :disabled="syncing === row.id" @click="openEdit(row)">编辑</FmButton><FmButton variant="danger" :disabled="syncing === row.id" @click="remove(row)">删除</FmButton></template>
     </FmDataTable>
 
-    <FmModal v-model="modal" wide :title="preview ? '确认添加信息' : '添加上游'" kicker="连接检查" :description="preview ? '确认无误后再创建目标并开始监听。' : '系统会自动读取模型，并确认能否持续获得实际倍率。'">
-      <form id="source-form" @submit.prevent="preview ? create() : detect()">
+    <FmModal v-model="modal" wide :title="editingId ? '编辑上游' : preview ? '确认添加信息' : '添加上游'" kicker="连接检查" :description="editingId ? '保存前会重新检查监听能力；失败时不会修改原配置。' : preview ? '确认无误后再创建目标并开始监听。' : '系统会自动读取模型，并确认能否持续获得实际倍率。'">
+      <form id="source-form" @submit.prevent="editingId ? update() : preview ? create() : detect()">
         <template v-if="!preview">
           <div class="grid-2">
             <label class="field"><span>上游名称</span><input v-model.trim="form.name" required placeholder="例如：低价文本上游" /></label>
             <label class="field"><span>上游地址</span><input v-model.trim="form.base_url" type="url" required placeholder="https://upstream.example.com" /></label>
           </div>
-          <label class="field"><span>普通 Key</span><input v-model="form.key" type="password" required autocomplete="off" /></label>
+          <label class="field"><span>普通 Key</span><input v-model="form.key" type="password" :required="!editingId" :placeholder="editingId ? '已保存，留空表示不修改' : ''" autocomplete="new-password" /><small v-if="editingId">更换 Key 后只更新监听连接；目标站中已存在的渠道或账号凭证仍需在目标站修改。</small></label>
           <details class="advanced"><summary>高级设置</summary><div class="advanced-body"><label class="field"><span>用于检查的文本模型</span><input v-model.trim="form.probe_model" placeholder="例如 gpt-4o-mini" /><small>Sub2API 可不填；New API 请填写一个便宜且可用的文本模型。</small></label></div></details>
-          <label v-if="!form.bind_existing" class="check"><input v-model="form.create_target" type="checkbox" />在我的站点自动创建渠道/账号，并建立同步任务</label>
-          <div v-else class="notice">已从站点关系树带入。目标平台不会导出账号的普通 Key，请在上方补填一次；系统校验可监听后才会绑定现有目标分组，且不会重复创建渠道/账号。</div>
-          <template v-if="form.create_target || form.bind_existing">
+          <label v-if="!editingId && !form.bind_existing" class="check"><input v-model="form.create_target" type="checkbox" />在我的站点自动创建渠道/账号，并建立同步任务</label>
+          <div v-else-if="!editingId && form.bind_existing" class="notice">已从站点关系树带入。目标平台不会导出账号的普通 Key，请在上方补填一次；系统校验可监听后才会绑定现有目标分组，且不会重复创建渠道/账号。</div>
+          <template v-if="!editingId && (form.create_target || form.bind_existing)">
             <div class="target-list">
               <section v-for="(target, index) in form.targets" :key="target.local_id" class="target-card">
                 <header><div><span class="fm-kicker">同步目标 {{ index + 1 }}</span><strong>{{ targetName(target) }}</strong></div><FmButton v-if="form.targets.length > 1" type="button" variant="ghost" @click="removeTarget(index)">移除</FmButton></header>
@@ -63,8 +63,8 @@
         <div v-if="error" class="notice error">{{ error }}</div>
       </form>
       <template #actions>
-        <FmButton variant="ghost" @click="preview ? preview = null : close()">{{ preview ? '返回修改' : '取消' }}</FmButton>
-        <FmButton variant="primary" type="submit" form="source-form" :loading="busy" :disabled="preview ? !canCreate : !targetReady">{{ preview ? '确认创建' : '开始检测' }}</FmButton>
+        <FmButton variant="ghost" @click="preview && !editingId ? preview = null : close()">{{ preview && !editingId ? '返回修改' : '取消' }}</FmButton>
+        <FmButton variant="primary" type="submit" form="source-form" :loading="busy" :disabled="editingId ? !form.name || !form.base_url : preview ? !canCreate : !targetReady">{{ editingId ? '保存并重新检查' : preview ? '确认创建' : '开始检测' }}</FmButton>
       </template>
     </FmModal>
 
@@ -116,7 +116,7 @@ import FmSelect from "../ui/freemodel/components/FmSelect.vue";
 import FmStatusPill from "../ui/freemodel/components/FmStatusPill.vue";
 import HealthStrip from "../components/HealthStrip.vue";
 
-const route = useRoute(), router = useRouter(), sources = ref([]), sites = ref([]), inventory = reactive({}), loading = ref(true), modal = ref(false), preview = ref(null), busy = ref(false), error = ref(""), syncing = ref(0), resultModal = ref(false), syncResult = ref(null);
+const route = useRoute(), router = useRouter(), sources = ref([]), sites = ref([]), inventory = reactive({}), loading = ref(true), modal = ref(false), preview = ref(null), busy = ref(false), error = ref(""), syncing = ref(0), editingId = ref(0), resultModal = ref(false), syncResult = ref(null);
 const filters = reactive({ query: "", state: "all" });
 const filterOptions = [{ value: "all", label: "全部" }, { value: "direct", label: "Sub2API 直接读取" }, { value: "newapi_probe", label: "New API 定时检查" }];
 let targetSequence = 0;
@@ -151,8 +151,9 @@ async function load() {
   } catch (e) { toast(e.message, "error"); }
   finally { loading.value = false; }
 }
-function open() { Object.assign(form, emptyForm()); preview.value = null; error.value = ""; modal.value = true; }
-function close() { modal.value = false; preview.value = null; router.replace({ path: "/sources" }); }
+function open() { editingId.value = 0; Object.assign(form, emptyForm()); preview.value = null; error.value = ""; modal.value = true; }
+function openEdit(source) { editingId.value = source.id; Object.assign(form, { ...emptyForm(), name: source.name, base_url: source.base_url, key: "", probe_model: source.probe_model || "", create_target: false, bind_existing: false, targets: [] }); preview.value = null; error.value = ""; modal.value = true; }
+function close() { modal.value = false; preview.value = null; editingId.value = 0; router.replace({ path: "/sources" }); }
 async function detect() {
   busy.value = true; error.value = "";
   try { preview.value = await api("/api/sources/detect", { method: "POST", body: JSON.stringify(requestPayload()) }); toast("上游检测完成，请确认预览信息", "success"); }
@@ -165,6 +166,15 @@ async function create() {
     await api("/api/sources", { method: "POST", body: JSON.stringify(requestPayload()) });
     const targetCount = (form.create_target || form.bind_existing) ? form.targets.length : 0;
     toast(targetCount ? `上游已添加，并为 ${targetCount} 个目标分组建立同步任务` : "上游已添加");
+    close(); Object.assign(form, emptyForm()); await load();
+  } catch (e) { error.value = e.message; toast(e.message, "error"); }
+  finally { busy.value = false; }
+}
+async function update() {
+  busy.value = true; error.value = "";
+  try {
+    await api(`/api/sources/${editingId.value}`, { method: "PUT", body: JSON.stringify(requestPayload()) });
+    toast("上游设置已更新，并通过重新检查", "success");
     close(); Object.assign(form, emptyForm()); await load();
   } catch (e) { error.value = e.message; toast(e.message, "error"); }
   finally { busy.value = false; }
