@@ -1,0 +1,9 @@
+/ratewatch
+/ratewatch.exe
+/ratewatch.db*
+/.env
+/web/node_modules/
+/web/dist/
+/.tmp-qa/
+/artifacts/
+*.log

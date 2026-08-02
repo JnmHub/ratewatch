@@ -1,0 +1,12 @@
+services:
+  ratewatch:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "8080:8080"
+    volumes:
+      - ratewatch-data:/data
+volumes:
+  ratewatch-data:
+
