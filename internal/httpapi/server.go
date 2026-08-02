@@ -7,11 +7,13 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"log"
 	"math"
 	"net/http"
 	"net/smtp"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -1315,11 +1317,7 @@ func (s *Server) frontend(w http.ResponseWriter, r *http.Request) {
 		problem(w, http.StatusNotFound, "接口不存在")
 		return
 	}
-	dist := os.Getenv("RATEWATCH_WEB_DIR")
-	if dist == "" {
-		dist = "web/dist"
-	}
-	clean := filepath.Clean(strings.TrimPrefix(r.URL.Path, "/"))
+	clean := path.Clean(strings.TrimPrefix(r.URL.Path, "/"))
 	if clean == "." {
 		clean = "index.html"
 	}
@@ -1327,15 +1325,32 @@ func (s *Server) frontend(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	path := filepath.Join(dist, clean)
-	if info, e := os.Stat(path); e == nil && !info.IsDir() {
-		http.ServeFile(w, r, path)
+	if dist := strings.TrimSpace(os.Getenv("RATEWATCH_WEB_DIR")); dist != "" {
+		filePath := filepath.Join(dist, filepath.FromSlash(clean))
+		if info, e := os.Stat(filePath); e == nil && !info.IsDir() {
+			http.ServeFile(w, r, filePath)
+			return
+		}
+		index := filepath.Join(dist, "index.html")
+		if _, e := os.Stat(index); e == nil {
+			http.ServeFile(w, r, index)
+			return
+		}
+		problem(w, 404, "配置的前端目录不可用")
 		return
 	}
-	index := filepath.Join(dist, "index.html")
-	if _, e := os.Stat(index); e == nil {
-		http.ServeFile(w, r, index)
+	if info, err := fs.Stat(embeddedFrontendFS, clean); clean == "index.html" || err != nil || info.IsDir() {
+		index, readErr := fs.ReadFile(embeddedFrontendFS, "index.html")
+		if readErr != nil {
+			problem(w, http.StatusInternalServerError, "内置管理网页不可用")
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write(index)
 		return
 	}
-	problem(w, 404, "前端尚未构建，请在 web 目录运行 npm run build")
+	request := r.Clone(r.Context())
+	request.URL.Path = "/" + clean
+	request.URL.RawPath = ""
+	embeddedFrontendHandler.ServeHTTP(w, request)
 }

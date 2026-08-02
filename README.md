@@ -67,7 +67,7 @@ npm install
 npm run dev
 ```
 
-Vite 会把 `/api` 代理到 `localhost:8080`。生产部署时先运行 `npm run build`，Go 服务会直接托管 `web/dist`。
+Vite 会把 `/api` 代理到 `localhost:8080`。正式发布的二进制已经内置管理网页，下载后可以直接运行；如需用自定义前端覆盖内置版本，可通过 `RATEWATCH_WEB_DIR` 指定前端目录。
 
 ## 站点接入说明
 
