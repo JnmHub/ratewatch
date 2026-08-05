@@ -6,13 +6,27 @@
     </header>
     <div class="notice">New API 会使用便宜文本模型进行极小用量检查；Sub2API 可直接读取当前倍率。系统不会主动调用生图模型。</div>
     <div class="filter-bar"><label class="field"><span>搜索上游</span><input v-model.trim="filters.query" placeholder="名称、平台或地址" /></label><label class="field"><span>监听方式</span><FmSelect v-model="filters.state" aria-label="监听方式" :options="filterOptions" /></label></div>
-    <FmDataTable :columns="columns" :rows="visibleSources" :loading="loading" empty-text="暂无符合条件的可监听上游">
-      <template #cell-monitor_state="{ value }"><FmStatusPill :variant="stateVariant(value)">{{ stateLabel(value) }}</FmStatusPill></template>
-      <template #cell-last_rate="{ value }"><span class="mono">{{ value == null ? '待探测' : fmt(value) }}</span></template>
-      <template #cell-models="{ value }">{{ value?.length || 0 }} 个模型</template>
-      <template #cell-health="{ row }"><HealthStrip :items="row.health_history" /></template>
-      <template #actions="{ row }"><FmButton variant="outline" :loading="syncing === row.id" @click="syncNow(row)">立刻同步并查看</FmButton><FmButton variant="ghost" :disabled="syncing === row.id" @click="openEdit(row)">编辑</FmButton><FmButton variant="danger" :disabled="syncing === row.id" @click="remove(row)">删除</FmButton></template>
-    </FmDataTable>
+    <FmStatePanel v-if="loading" state="loading" title="正在读取上游" />
+    <FmStatePanel v-else-if="!visibleSources.length" state="empty" title="暂无符合条件的可监听上游" />
+    <div v-else class="source-grid">
+      <article v-for="source in visibleSources" :key="source.id" class="source-card fm-card">
+        <header class="source-card-head">
+          <div class="source-identity"><span class="fm-kicker">{{ source.platform }}</span><h2>{{ source.name }}</h2><p>{{ source.base_url }}</p></div>
+          <FmStatusPill :variant="stateVariant(source.monitor_state)">{{ stateLabel(source.monitor_state) }}</FmStatusPill>
+        </header>
+        <div class="source-metrics">
+          <div><span>当前倍率</span><strong class="mono">{{ source.last_rate == null ? '待探测' : fmt(source.last_rate) }}</strong></div>
+          <div><span>可用模型</span><strong class="mono">{{ source.models?.length || 0 }}</strong></div>
+          <div><span>最近检查</span><strong>{{ shortDate(source.last_checked_at) }}</strong></div>
+        </div>
+        <section class="trend-panel">
+          <div class="trend-heading"><div><span class="fm-kicker">RATE HISTORY</span><h3>倍率变化</h3></div><small>最近 {{ validRateCount(source.health_history) }} 次有效记录</small></div>
+          <SourceRateChart :items="source.health_history" />
+        </section>
+        <section class="health-panel"><div class="trend-heading"><div><span class="fm-kicker">RECENT CHECKS</span><h3>运行状态</h3></div></div><HealthStrip :items="source.health_history" /></section>
+        <footer class="source-actions"><FmButton variant="outline" :loading="syncing === source.id" @click="syncNow(source)">立刻同步并查看</FmButton><FmButton variant="ghost" :disabled="syncing === source.id" @click="openEdit(source)">编辑</FmButton><FmButton variant="danger" :disabled="syncing === source.id" @click="remove(source)">删除</FmButton></footer>
+      </article>
+    </div>
 
     <FmModal v-model="modal" wide :title="editingId ? '编辑上游' : preview ? '确认添加信息' : '添加上游'" kicker="连接检查" :description="editingId ? '保存前会重新检查监听能力；失败时不会修改原配置。' : preview ? '确认无误后再创建目标并开始监听。' : '系统会自动读取模型，并确认能否持续获得实际倍率。'">
       <form id="source-form" @submit.prevent="editingId ? update() : preview ? create() : detect()">
@@ -110,11 +124,12 @@ import { computed, onMounted, reactive, ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { api, toast } from "../api/client.js";
 import FmButton from "../ui/freemodel/components/FmButton.vue";
-import FmDataTable from "../ui/freemodel/components/FmDataTable.vue";
 import FmModal from "../ui/freemodel/components/FmModal.vue";
 import FmSelect from "../ui/freemodel/components/FmSelect.vue";
+import FmStatePanel from "../ui/freemodel/components/FmStatePanel.vue";
 import FmStatusPill from "../ui/freemodel/components/FmStatusPill.vue";
 import HealthStrip from "../components/HealthStrip.vue";
+import SourceRateChart from "../components/SourceRateChart.vue";
 
 const route = useRoute(), router = useRouter(), sources = ref([]), sites = ref([]), inventory = reactive({}), loading = ref(true), modal = ref(false), preview = ref(null), busy = ref(false), error = ref(""), syncing = ref(0), editingId = ref(0), resultModal = ref(false), syncResult = ref(null);
 const filters = reactive({ query: "", state: "all" });
@@ -123,7 +138,6 @@ let targetSequence = 0;
 const emptyTarget = values => ({ local_id: ++targetSequence, site_id: 0, group_id: 0, account_id: 0, minimum_upstream_rate: 0, adjustment: 0, ...values });
 const emptyForm = () => ({ name: "", base_url: "", key: "", probe_model: "", create_target: true, bind_existing: false, targets: [emptyTarget()] });
 const form = reactive(emptyForm());
-const columns = [{ key: "name", label: "名称" }, { key: "platform", label: "平台" }, { key: "monitor_state", label: "监听状态" }, { key: "last_rate", label: "当前倍率" }, { key: "health", label: "最近检查" }, { key: "models", label: "模型" }];
 const siteOptions = computed(() => sites.value.map(site => ({ value: site.id, label: `${site.name} · ${site.platform}` })));
 const canCreate = computed(() => preview.value?.capability?.monitor_state === "direct" || (preview.value?.capability?.monitor_state === "newapi_probe" && preview.value?.capability?.rate != null));
 const hasDuplicateTarget = computed(() => form.targets.some((target, index) => target.group_id > 0 && form.targets.findIndex(item => item.group_id === target.group_id) !== index));
@@ -197,6 +211,8 @@ async function remove(source) {
   catch (e) { toast(e.message, "error"); }
 }
 const fmt = value => Number(value ?? 0).toFixed(4).replace(/0+$/, "").replace(/\.$/, "");
+const shortDate = value => value ? new Date(value).toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false }) : "等待检查";
+const validRateCount = history => (history || []).filter(item => item.rate != null && Number.isFinite(Number(item.rate))).length;
 const stateLabel = value => ({ direct: "可直接监听", newapi_probe: "New API 探测", passive_image: "仅生图观测", missing_key: "缺少 Key", unsupported: "不支持", check_failed: "检查失败", demo: "演示数据" }[value] || value);
 const stateVariant = value => ({ direct: "ok", newapi_probe: "info", passive_image: "warn", missing_key: "warn", unsupported: "error", check_failed: "error", demo: "neutral" }[value] || "neutral");
 const outcomeLabel = value => ({ synced: "已同步", unchanged: "无变化", failed: "失败", blocked: "已阻止", observed: "仅观察", skipped: "已跳过" }[value] || value);
@@ -213,6 +229,7 @@ onMounted(async () => {
 
 <style scoped>
 .filter-bar{display:grid;grid-template-columns:minmax(240px,1fr) minmax(170px,.25fr);gap:12px;margin:16px 0}.filter-bar .field{margin:0}
+.source-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.source-card{display:grid;align-content:start;gap:16px;min-width:0;padding:20px}.source-card-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px}.source-identity{min-width:0}.source-identity h2{margin:4px 0 3px;font-size:18px}.source-identity p{max-width:100%;margin:0;color:var(--fm-ink-muted);font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.source-metrics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));border:1px solid var(--fm-line-soft);border-radius:10px;background:var(--fm-bg-warm)}.source-metrics div{display:grid;gap:4px;padding:12px 14px;border-right:1px solid var(--fm-line-soft)}.source-metrics div:last-child{border-right:0}.source-metrics span{color:var(--fm-ink-muted);font-size:9px;letter-spacing:.05em}.source-metrics strong{font-size:15px;overflow-wrap:anywhere}.trend-panel,.health-panel{min-width:0;padding:14px;border:1px solid var(--fm-line-soft);border-radius:11px}.trend-heading{display:flex;align-items:flex-end;justify-content:space-between;gap:12px;margin-bottom:10px}.trend-heading h3{margin:2px 0 0;font-size:14px}.trend-heading small{color:var(--fm-ink-muted);font-size:10px}.health-panel{padding-bottom:12px}.health-panel :deep(.health-wrap){margin-top:0}.health-panel :deep(.health-strip){grid-template-columns:repeat(20,minmax(10px,1fr));width:100%}.health-panel :deep(.health-cell){width:100%}.source-actions{display:flex;justify-content:flex-end;gap:8px;padding-top:2px}
 .target-list,.preview-targets{display:grid;gap:12px}.target-card,.preview-targets article{padding:16px;border:1px solid var(--fm-line);border-radius:12px;background:var(--fm-bg-warm)}.target-card>header,.preview-targets article>header{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:13px}.target-card>header>div{display:grid;gap:4px}.target-card>header strong,.preview-targets article>header strong{font-size:13px}.preview-targets{margin-top:16px}.preview-targets article>header span{color:var(--fm-ink-muted);font-size:10px}.preview-targets article dl{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin:0}.preview-targets article dl div{display:grid;gap:4px;padding:9px;border-radius:8px;background:var(--fm-bg-card)}.preview-targets article dt{color:var(--fm-ink-muted);font-size:9px}.preview-targets article dd{margin:0;font-size:12px}
 .sync-overview{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.sync-overview article{display:grid;align-content:start;gap:7px;min-height:112px;padding:15px;border:1px solid var(--fm-line-soft);border-radius:10px;background:var(--fm-bg-warm)}.sync-overview strong{font-size:24px;font-variant-numeric:tabular-nums}.sync-overview small{color:var(--fm-ink-muted);font-size:10px}
 .result-section{margin-top:22px}.result-heading{display:flex;align-items:end;justify-content:space-between;gap:12px;margin-bottom:11px}.result-heading h3{margin:3px 0 0;font-size:16px}.model-count{padding:4px 7px;border-radius:6px;background:var(--fm-bg-warm);color:var(--fm-ink-muted);font-size:10px}.model-note{margin:-3px 0 9px;color:var(--fm-warn);font-size:11px}
@@ -220,5 +237,5 @@ onMounted(async () => {
 .task-results{display:grid;gap:9px}.task-results article{padding:15px;border:1px solid var(--fm-line);border-radius:11px;background:var(--fm-bg-card)}.task-results header{display:flex;align-items:start;justify-content:space-between;gap:12px}.task-results header>div{display:grid;gap:3px}.task-results header strong{font-size:13px}.task-results header small{color:var(--fm-ink-muted);font-size:10px}.task-results dl{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin:13px 0 0}.task-results dl div{display:grid;gap:3px;padding:8px;border-radius:7px;background:var(--fm-bg-warm)}.task-results dt{color:var(--fm-ink-muted);font-size:9px}.task-results dd{margin:0;color:var(--fm-ink-soft);font-size:11px;overflow-wrap:anywhere}.task-results p{margin:10px 0 0;color:var(--fm-ink-soft);font-size:11px}
 .result-empty{padding:20px;border:1px dashed var(--fm-line);border-radius:10px;color:var(--fm-ink-muted);font-size:12px;text-align:center}
 .model-source{display:block;margin-top:5px;color:var(--fm-ink-muted);font-size:10px;line-height:1.5}
-@media(max-width:640px){.filter-bar,.sync-overview,.task-results dl,.preview-targets article dl{grid-template-columns:1fr}.sync-overview article{min-height:0}}
+@media(max-width:980px){.source-grid{grid-template-columns:1fr}}@media(max-width:640px){.filter-bar,.sync-overview,.task-results dl,.preview-targets article dl{grid-template-columns:1fr}.sync-overview article{min-height:0}.source-card{padding:16px}.source-card-head{align-items:flex-start}.source-metrics{grid-template-columns:1fr}.source-metrics div{grid-template-columns:1fr 1fr;align-items:center;border-right:0;border-bottom:1px solid var(--fm-line-soft)}.source-metrics div:last-child{border-bottom:0}.source-metrics strong{text-align:right}.source-actions{display:grid;grid-template-columns:1fr 1fr}.source-actions :first-child{grid-column:1/-1}}@media(max-width:420px){.source-actions{grid-template-columns:1fr}.source-actions :first-child{grid-column:auto}.source-card-head{display:grid}.source-card-head>span{justify-self:start}}
 </style>
